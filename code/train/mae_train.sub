@@ -1,0 +1,33 @@
+# mae_train.sub
+# Specify the Apptainer image
+container_image = file:///staging/negreiro/mae.sif
+
+executable = mae_train.sh
+arguments = $(batch)
+
+output = /home/negreiro/MAE/logs/mae_train$(Cluster)_$(Process)_$(batch).out
+error = /home/negreiro/MAE/logs/mae_train$(Cluster)_$(Process)_$(batch).err
+log = /home/negreiro/MAE/logs/mae_train$(Cluster)_$(batch).log
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+transfer_input_files = mae_train.py, mae_train.sh, /home/negreiro/MAE/code/utils/mae_code.py
+
+# GPU requirements
+require_gpus = (Capability <= 7.5)
+requirements = (Target.HasCHTCStaging == true) 
+request_gpus = 1
++WantGPULab = true
++GPUJobLength = "medium"
+
+# Resource requests
+request_cpus = 1
+request_memory = 16GB
+request_disk = 32GB
+
+# Enable streaming output
+stream_output = True
+stream_error = True
+
+# Queue jobs based on batches.txt
+queue batch from batches_train.txt
