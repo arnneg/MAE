@@ -22,6 +22,7 @@ import argparse
 from sklearn.model_selection import train_test_split
 import glob
 import pandas as pd
+from sklearn.manifold import TSNE
 
 # Define the debug CSV generation function here, before it's used
 def generate_patch_debug_csv(patches, mask_indices, image_idx, save_dir, prefix="debug"):
@@ -108,8 +109,8 @@ WEIGHT_DECAY = 1e-4
 # PRETRAINING
 EPOCHS = 20  # Increase epochs for better learning
 
-# Update masking proportion to 75%
-MASK_PROPORTION = 0.75  # Now represents a percentage (75%) of valid patches to mask
+# Update masking proportion to fixed approach
+MASK_PROPORTION = 0.4  # Represents max percentage of valid patches to mask (40% = 60% visibility)
 
 # Model architecture dimensions
 ENC_PROJECTION_DIM = 24  # Increased from 12
@@ -361,12 +362,15 @@ def visualize_masking_strategy(image, patches, mask_indices, patch_layer, vis_di
     # Create binary masks for visualization
     valid_mask = np.zeros((patch_dim, patch_dim))  # For animal patches (depth > 0)
     masked_animal = np.zeros((patch_dim, patch_dim))  # For masked animal patches
+    masked_background = np.zeros((patch_dim, patch_dim))  # For masked background patches
     unmasked_animal = np.zeros((patch_dim, patch_dim))  # For unmasked animal patches
     
     # Count patches for validation
-    valid_count = 0
-    masked_count = 0
-    unmasked_valid_count = 0
+    valid_count = 0  # Animal patches
+    background_count = 0  # Background patches
+    masked_valid_count = 0  # Masked animal patches
+    masked_background_count = 0  # Masked background patches
+    unmasked_valid_count = 0  # Unmasked animal patches
     
     # Fill the masks
     for i in range(patches.shape[0]):
@@ -382,59 +386,98 @@ def visualize_masking_strategy(image, patches, mask_indices, patch_layer, vis_di
             valid_mask[row, col] = 1
             
             if is_masked:
-                masked_count += 1
+                masked_valid_count += 1
                 masked_animal[row, col] = 1
             else:
                 unmasked_valid_count += 1
                 unmasked_animal[row, col] = 1
+        else:
+            background_count += 1
+            if is_masked:
+                masked_background_count += 1
+                masked_background[row, col] = 1
     
     # Calculate percentages for validation
     if valid_count > 0:
         unmasked_percentage = (unmasked_valid_count / valid_count) * 100
-        masked_percentage = (masked_count / valid_count) * 100
+        masked_percentage = (masked_valid_count / valid_count) * 100
     else:
         unmasked_percentage = 0
         masked_percentage = 0
+    
+    total_masked = masked_valid_count + masked_background_count
+    valid_mask_percentage = (masked_valid_count / total_masked * 100) if total_masked > 0 else 0
     
     # Create visualization
     plt.figure(figsize=(15, 10))
     
     # Original image
-    plt.subplot(2, 2, 1)
+    plt.subplot(2, 3, 1)
     plt.imshow(image, cmap='gray')
     plt.title("Original Image")
     plt.axis("off")
     
     # Animal body mask (valid patches)
-    plt.subplot(2, 2, 2)
+    plt.subplot(2, 3, 2)
     # Upscale the mask to match image dimensions
     valid_mask_upscaled = np.repeat(np.repeat(valid_mask, patch_size, axis=0), patch_size, axis=1)
     plt.imshow(image, cmap='gray')
     plt.imshow(valid_mask_upscaled, alpha=0.4, cmap='cool')
-    plt.title(f"Animal Body (valid patches): {valid_count} patches")
+    plt.title(f"Animal Body: {valid_count} patches\nBackground: {background_count} patches")
     plt.axis("off")
     
     # Masked animal parts
-    plt.subplot(2, 2, 3)
+    plt.subplot(2, 3, 3)
     # Upscale the mask to match image dimensions
     masked_animal_upscaled = np.repeat(np.repeat(masked_animal, patch_size, axis=0), patch_size, axis=1)
     plt.imshow(image, cmap='gray')
     plt.imshow(masked_animal_upscaled, alpha=0.6, cmap='Reds')
-    plt.title(f"Masked Animal Parts: {masked_count} patches ({masked_percentage:.1f}% of animal)")
+    plt.title(f"Masked Animal: {masked_valid_count} patches\n({masked_percentage:.1f}% of animal)")
     plt.axis("off")
     
     # Unmasked animal parts (preserved)
-    plt.subplot(2, 2, 4)
+    plt.subplot(2, 3, 4)
     # Upscale the mask to match image dimensions
     unmasked_animal_upscaled = np.repeat(np.repeat(unmasked_animal, patch_size, axis=0), patch_size, axis=1)
     plt.imshow(image, cmap='gray')
     plt.imshow(unmasked_animal_upscaled, alpha=0.6, cmap='Greens')
-    plt.title(f"Preserved Animal Parts: {unmasked_valid_count} patches ({unmasked_percentage:.1f}% of animal)")
+    plt.title(f"Preserved Animal: {unmasked_valid_count} patches\n({unmasked_percentage:.1f}% of animal)")
+    plt.axis("off")
+    
+    # Masked background parts
+    plt.subplot(2, 3, 5)
+    masked_background_upscaled = np.repeat(np.repeat(masked_background, patch_size, axis=0), patch_size, axis=1)
+    plt.imshow(image, cmap='gray')
+    plt.imshow(masked_background_upscaled, alpha=0.6, cmap='Blues')
+    plt.title(f"Masked Background: {masked_background_count} patches")
+    plt.axis("off")
+    
+    # Combined mask view
+    plt.subplot(2, 3, 6)
+    # Create a combined visualization with different colors for different categories
+    combined_mask = np.zeros((image.shape[0], image.shape[1], 4))  # RGBA
+    
+    # Red channel - masked animal
+    combined_mask[:,:,0] = masked_animal_upscaled * 0.8
+    # Green channel - unmasked animal
+    combined_mask[:,:,1] = unmasked_animal_upscaled * 0.8
+    # Blue channel - masked background
+    combined_mask[:,:,2] = masked_background_upscaled * 0.8
+    # Alpha channel - transparency where we have any mask
+    combined_mask[:,:,3] = np.maximum(np.maximum(
+        masked_animal_upscaled, 
+        unmasked_animal_upscaled), 
+        masked_background_upscaled) * 0.7
+    
+    plt.imshow(image, cmap='gray')
+    plt.imshow(combined_mask)
+    plt.title("Combined Mask View")
     plt.axis("off")
     
     # Add validation text at bottom
     plt.figtext(0.5, 0.01, 
-               f"Validation: {unmasked_percentage:.1f}% of animal body preserved (target: ≥25%)",
+               f"Summary: Total masked: {total_masked} patches | {masked_valid_count} animal + {masked_background_count} background\n"
+               f"Animal preservation: {unmasked_percentage:.1f}% | Target: ≥60%", 
                ha='center', fontsize=12, 
                bbox={'facecolor':'yellow', 'alpha':0.3, 'pad':5})
     
@@ -444,10 +487,14 @@ def visualize_masking_strategy(image, patches, mask_indices, patch_layer, vis_di
     
     return {
         'valid_count': valid_count,
-        'masked_count': masked_count,
+        'masked_valid_count': masked_valid_count,
         'unmasked_valid_count': unmasked_valid_count,
+        'background_count': background_count,
+        'masked_background_count': masked_background_count,
         'unmasked_percentage': unmasked_percentage,
-        'masked_percentage': masked_percentage
+        'masked_percentage': masked_percentage,
+        'total_masked': total_masked,
+        'valid_mask_percentage': valid_mask_percentage
     }
 
 # Verify masking strategy on demo images
@@ -464,9 +511,16 @@ for i in range(min(4, len(demo_images))):
     )
     all_stats.append(stats)
 
-# Summarize stats in one line instead of multiple prints
+# Generate more comprehensive statistics summary
 avg_unmasked = sum(s['unmasked_percentage'] for s in all_stats) / len(all_stats)
-print(f"Average animal body preservation: {avg_unmasked:.1f}% across {len(all_stats)} images")
+avg_masked_animal = sum(s['masked_valid_count'] for s in all_stats) / len(all_stats)
+avg_masked_background = sum(s['masked_background_count'] for s in all_stats) / len(all_stats)
+avg_valid_mask_percentage = sum(s['valid_mask_percentage'] for s in all_stats) / len(all_stats)
+
+print(f"Masking statistics across {len(all_stats)} sample images:")
+print(f"  Animal body preservation: {avg_unmasked:.1f}% (target: ≥60%)")
+print(f"  Average masked patches: {avg_masked_animal:.1f} animal + {avg_masked_background:.1f} background")
+print(f"  Percentage of masks on animal regions: {avg_valid_mask_percentage:.1f}%")
 
 # Generate masked versions
 demo_masked_patches = patch_encoder.generate_masked_images(
@@ -474,46 +528,69 @@ demo_masked_patches = patch_encoder.generate_masked_images(
 )
 
 # Create visualization to show smart masking on actual segmented animal images
-plt.figure(figsize=(16, 16))
+plt.figure(figsize=(16, 12))
 for i in range(4):
     # Original segmented animal image
-    plt.subplot(4, 3, i*3+1)
+    plt.subplot(4, 2, i*2+1)
     plt.imshow(demo_images[i], cmap='gray')
     plt.axis("off")
     if i == 0:
-        plt.title("Original\nsegmented animal")
+        plt.title("Original Segmented Animal")
     
-    # Patches that are masked - show as overlay on original image
-    plt.subplot(4, 3, i*3+2)
+    # Masked image with overlay
+    plt.subplot(4, 2, i*2+2)
+    
     # Create a copy of the original image
     overlay_img = demo_images[i].numpy().copy()
+    
     # Get coordinates of masked patches
     patch_coords = np.unravel_index(demo_mask_indices[i].numpy(), 
                                    (int(np.sqrt(demo_patches.shape[1])), 
                                     int(np.sqrt(demo_patches.shape[1]))))
     
-    # Create the overlay mask
+    # Create a mask to identify animal parts
+    animal_mask = np.mean(np.abs(demo_patches[i].numpy()), axis=1) > 0
+    
+    # Create the overlay mask - different colors for animal vs background
     mask_overlay = np.ones_like(overlay_img)
+    animal_overlay = np.zeros_like(overlay_img)
+    background_overlay = np.zeros_like(overlay_img)
+    
+    # Process each masked patch
     for j in range(len(patch_coords[0])):
         row, col = patch_coords[0][j], patch_coords[1][j]
-        # Add a colored highlight to masked regions
+        patch_idx = row * int(np.sqrt(demo_patches.shape[1])) + col
+        
+        # Mark the patch in the overlay
         mask_overlay[row*PATCH_SIZE:(row+1)*PATCH_SIZE, 
                     col*PATCH_SIZE:(col+1)*PATCH_SIZE] = 0.7
-                    
-    # Apply the overlay
-    plt.imshow(overlay_img, cmap='gray')
-    plt.imshow(mask_overlay, cmap='Blues', alpha=0.5)  # Blue tint for masked regions
-    plt.axis("off")
-    if i == 0:
-        plt.title("Masked Regions\n(highlighted in blue)")
+        
+        # Use different colors for animal vs background
+        if patch_idx < len(animal_mask) and animal_mask[patch_idx]:
+            # Animal patch - use red
+            animal_overlay[row*PATCH_SIZE:(row+1)*PATCH_SIZE, 
+                          col*PATCH_SIZE:(col+1)*PATCH_SIZE] = 1
+        else:
+            # Background patch - use blue
+            background_overlay[row*PATCH_SIZE:(row+1)*PATCH_SIZE, 
+                              col*PATCH_SIZE:(col+1)*PATCH_SIZE] = 1
     
-    # Result after masking
-    plt.subplot(4, 3, i*3+3)
-    masked_img = patch_layer.reconstruct_from_patch(demo_masked_patches[i])
-    plt.imshow(masked_img, cmap='gray')
-    plt.axis("off")
+    # Show original image
+    plt.imshow(overlay_img, cmap='gray')
+    
+    # Apply the overlays with different colors
+    plt.imshow(animal_overlay, cmap='Reds', alpha=0.5 * mask_overlay)
+    plt.imshow(background_overlay, cmap='Blues', alpha=0.5 * mask_overlay)
+    
+    # Add title with mask count
     if i == 0:
-        plt.title("Result after\nsmart masking")
+        plt.title(f"Fixed 40 Masks\n(Red = animal, Blue = background)")
+    
+    # Add mask count as text
+    animal_count = np.sum(animal_mask[demo_mask_indices[i].numpy()])
+    bg_count = len(demo_mask_indices[i].numpy()) - animal_count
+    plt.text(5, 15, f"Animal: {animal_count}/{len(demo_mask_indices[i].numpy())}", 
+            color='white', fontsize=10, bbox=dict(facecolor='black', alpha=0.5))
 
 plt.tight_layout()
 plt.savefig(os.path.join(vis_dir, 'smart_masking_real_examples.png'))
@@ -526,7 +603,7 @@ test_augmentation_model = get_test_augmentation_model()
 patch_layer = Patches()
 patch_encoder = PatchEncoder(mask_proportion=MASK_PROPORTION)
 encoder = create_encoder()
-decoder = create_decoder()
+decoder = create_improved_decoder()
 
 # ### Learning rate scheduler
 # Some code is taken from:
@@ -599,6 +676,7 @@ plt.ylabel("LR", fontsize=14)
 plt.savefig(os.path.join(vis_dir, 'learning_rate_schedule.png'))
 plt.close()
 
+# Create the model
 mae_model = MaskedAutoencoder(
     train_augmentation_model=train_augmentation_model,
     test_augmentation_model=test_augmentation_model,
@@ -749,7 +827,7 @@ class TrainMonitor(keras.callbacks.Callback):
                 plt.savefig(os.path.join(self.vis_dir, f"epoch_{epoch:03d}_test_results.png"), dpi=150)
             plt.close()
 
-# Assemble the callbacks.
+# Assemble the callbacks without progressive masking.
 train_callbacks = [TrainMonitor(epoch_interval=5, vis_dir=vis_dir)]
 
 # Add early stopping callback
@@ -778,14 +856,191 @@ print(f"Validation: {len(validation_files)} images ({len(validation_dataset)} ba
 print(f"Test:       {len(test_files)} images ({len(test_dataset)} batches of size {BATCH_SIZE})")
 print(f"Total:      {len(train_files) + len(validation_files) + len(test_files)} images\n")
 
-# Train with verbose=1 to show only one progress bar per epoch
+# Run a shorter pretraining stage
+history_pretrain = mae_model.fit(
+    train_dataset, 
+    epochs=10,  # Shorter pretraining
+    validation_data=validation_dataset, 
+    callbacks=train_callbacks,
+    verbose=2  # 0=silent, 1=progress bar, 2=one line per epoch
+)
+
+# Main training with MSE loss
+print("\nStarting main training phase...")
 history = mae_model.fit(
     train_dataset, 
     epochs=EPOCHS, 
     validation_data=validation_dataset, 
     callbacks=train_callbacks,
-    verbose=1  # 0=silent, 1=progress bar, 2=one line per epoch
+    verbose=2  # 0=silent, 1=progress bar, 2=one line per epoch
 )
+
+# Optional: Finetune with combined loss
+# Comment out if you don't want to run finetuning
+print("\nStarting finetuning with combined loss...")
+mae_model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),  # Lower learning rate
+    loss=combined_reconstruction_loss,
+    metrics=["mae"],
+)
+history_finetune = mae_model.fit(
+    train_dataset, 
+    epochs=10,
+    validation_data=validation_dataset, 
+    callbacks=train_callbacks,
+    verbose=2  # 0=silent, 1=progress bar, 2=one line per epoch
+)
+
+# Better Evaluation Function - Compare with Original MAE Paper Metrics
+
+def evaluate_mae_reconstruction(model, dataset, num_examples=10):
+    """Evaluate MAE reconstruction quality with multiple metrics"""
+    # Get a batch of images
+    image_batch = next(iter(dataset))
+    
+    # Process the batch similar to the visualization function
+    augmented_images = model.test_augmentation_model(image_batch)
+    patches = model.patch_layer(augmented_images)
+    
+    # Encode and decode
+    (unmasked_embeddings, masked_embeddings, unmasked_positions, 
+     mask_indices, unmask_indices) = model.patch_encoder(patches)
+    
+    encoder_outputs = model.encoder(unmasked_embeddings)
+    encoder_outputs = encoder_outputs + unmasked_positions
+    decoder_inputs = tf.concat([encoder_outputs, masked_embeddings], axis=1)
+    reconstructed_batch = model.decoder(decoder_inputs)
+    
+    # Calculate metrics only on the masked regions
+    mse_masked = []
+    psnr_masked = []
+    ssim_masked = []
+    
+    # Create masks for evaluation
+    for i in range(min(num_examples, len(augmented_images))):
+        original = augmented_images[i].numpy()
+        reconstructed = reconstructed_batch[i].numpy()
+        
+        # Create a binary mask (1 for masked regions, 0 elsewhere)
+        mask = np.zeros_like(original)
+        
+        # Use mask_indices to find masked regions
+        indices = mask_indices[i].numpy()
+        mask_count = getattr(model.patch_encoder, 'mask_counts_per_image', None)
+        if mask_count is not None:
+            indices = indices[:mask_count[i].numpy()]
+            
+        # Create patch mask
+        patch_size = model.patch_layer.patch_size
+        patch_dim = int(np.sqrt(patches.shape[1]))
+        
+        # Convert flat indices to 2D grid
+        patch_indices = np.unravel_index(indices, (patch_dim, patch_dim))
+        
+        # Mark masked patches in the mask
+        for j in range(len(indices)):
+            row, col = patch_indices[0][j], patch_indices[1][j]
+            mask[row*patch_size:(row+1)*patch_size, 
+                col*patch_size:(col+1)*patch_size] = 1
+        
+        # Calculate metrics only on masked regions
+        # MSE
+        masked_original = original * mask
+        masked_recon = reconstructed * mask
+        mse = np.mean((masked_original - masked_recon) ** 2)
+        mse_masked.append(mse)
+        
+        # PSNR (need to handle edge case where mse=0)
+        if mse > 0:
+            psnr = 20 * np.log10(1.0 / np.sqrt(mse))  # Assuming max value is 1.0
+        else:
+            psnr = 100.0  # Arbitrary high value
+        psnr_masked.append(psnr)
+        
+        # SSIM would require additional implementation
+        # Using a placeholder value for now
+        ssim_masked.append(0.0)
+        
+    # Return average metrics
+    return {
+        'masked_mse': np.mean(mse_masked),
+        'masked_psnr': np.mean(psnr_masked),
+        'masked_ssim': np.mean(ssim_masked)
+    }
+
+# Call this function after training to evaluate your model
+metrics = evaluate_mae_reconstruction(mae_model, test_dataset)
+print(f"Evaluation metrics: {metrics}")
+
+# Visualize the latent space to understand what the model has learned
+
+def visualize_latent_space(model, dataset, vis_dir, n_examples=100):
+    """Visualize the latent space encoded by the MAE model"""
+    # Collect embeddings for n_examples
+    embeddings = []
+    images = []
+    
+    for batch in dataset.take(n_examples // 32 + 1):
+        augmented_batch = model.test_augmentation_model(batch)
+        patches = model.patch_layer(augmented_batch)
+        
+        # Get encoder embeddings (using downstream mode to get all patches)
+        patch_encoder = PatchEncoder(downstream=True)
+        patch_embeddings = patch_encoder(patches)
+        
+        # Get encoder outputs
+        encoder_outputs = model.encoder(patch_embeddings)
+        
+        # Average pool to get a single vector per image
+        batch_embeddings = tf.reduce_mean(encoder_outputs, axis=1)
+        
+        embeddings.extend(batch_embeddings.numpy())
+        images.extend(augmented_batch.numpy())
+        
+        if len(embeddings) >= n_examples:
+            break
+    
+    embeddings = np.array(embeddings[:n_examples])
+    images = np.array(images[:n_examples])
+    
+    # Reduce dimensionality for visualization
+    tsne = TSNE(n_components=2, random_state=42)
+    embeddings_2d = tsne.fit_transform(embeddings)
+    
+    # Plot the 2D embeddings
+    plt.figure(figsize=(10, 10))
+    plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], alpha=0.5)
+    plt.title('t-SNE visualization of MAE latent space')
+    plt.savefig(os.path.join(vis_dir, 'latent_space_tsne.png'))
+    
+    # Also create a grid of the closest points in latent space
+    from sklearn.neighbors import NearestNeighbors
+    
+    nn = NearestNeighbors(n_neighbors=16)
+    nn.fit(embeddings)
+    
+    # Select a random point and find its neighbors
+    random_idx = np.random.randint(len(embeddings))
+    distances, indices = nn.kneighbors(embeddings[random_idx:random_idx+1])
+    
+    # Plot the query image and its nearest neighbors
+    plt.figure(figsize=(12, 12))
+    plt.subplot(4, 4, 1)
+    plt.imshow(images[random_idx], cmap='gray')
+    plt.title('Query Image')
+    plt.axis('off')
+    
+    for i, idx in enumerate(indices[0][1:]):
+        plt.subplot(4, 4, i+2)
+        plt.imshow(images[idx], cmap='gray')
+        plt.title(f'Neighbor {i+1}')
+        plt.axis('off')
+    
+    plt.savefig(os.path.join(vis_dir, 'nearest_neighbors.png'))
+    plt.close('all')
+
+# Option to visualize latent space
+visualize_latent_space(mae_model, test_dataset, vis_dir)
 
 # ## Saving the pre trained model
 
@@ -852,7 +1107,7 @@ test_augmentation_model = get_test_augmentation_model()
 patch_layer = Patches()
 patch_encoder = PatchEncoder(mask_proportion=MASK_PROPORTION)
 encoder = create_encoder()
-decoder = create_decoder()
+decoder = create_improved_decoder()
 
 model = MaskedAutoencoder(
     train_augmentation_model=train_augmentation_model,
@@ -863,17 +1118,17 @@ model = MaskedAutoencoder(
     decoder=decoder,
 )
 
-# Use AdamW optimizer for the testing model as well
+# Use AdamW optimizer for the testing model
 optimizer = tfa.optimizers.AdamW(
     learning_rate=scheduled_lrs, 
     weight_decay=WEIGHT_DECAY,
-    clipnorm=1.0,  # Add gradient clipping for stability
+    clipnorm=1.0,
 )
 
-# Compile the model with MSE loss for better pixel-level reconstruction
+# Compile the model
 model.compile(
     optimizer=optimizer, 
-    loss=keras.losses.MeanSquaredError(), 
+    loss=keras.losses.MeanSquaredError(),
     metrics=["mae"],
 )
 
@@ -907,13 +1162,7 @@ if latest_checkpoint:
         print(f"H5 weight files found at: {weights_dir}")
 else:
     print("No checkpoint found. Will use randomly initialized weights.")
-    
-    # Check if the directory exists but no checkpoint files
-    if os.path.exists(checkpoint_directory):
-        files = os.listdir(checkpoint_directory)
-        print(f"The checkpoint directory exists but contains: {files}")
-    else:
-        print(f"Checkpoint directory does not exist: {checkpoint_directory}")
+
 
 def visualize_results(model, augmented_images, save_dir=None):
     # Patch the augmented images.
@@ -1026,11 +1275,13 @@ def visualize_results(model, augmented_images, save_dir=None):
               ax2[i, 2].set_title("Enhanced Recon")
               
         plt.suptitle("MAE Reconstruction - Enhanced contrast", fontsize=10)
-        plt.savefig(os.path.join(save_dir, 'enhanced_final_results.png'), dpi=150)
+        plt.savefig(os.path.join(vis_dir, 'enhanced_final_results.png'), dpi=150)
     
     plt.close('all')
 
+# Create final visualizations
 images = next(iter(test_dataset))
-
 augmented_images = test_augmentation_model(images)
-visualize_results(model, augmented_images, save_dir=vis_dir)
+visualize_results(mae_model, augmented_images, save_dir=vis_dir)
+
+print("Training and evaluation complete!")

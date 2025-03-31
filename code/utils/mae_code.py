@@ -14,17 +14,17 @@ IMAGE_SIZE = 128  # We will resize input images to this size.
 CHANNELS = 1
 PATCH_SIZE = 8  # Changed from 16 to 8 for smaller patches
 NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2  # Now 256 instead of 64
-MASK_PROPORTION = 0.75  # Now represents a percentage (75%) of valid patches to mask
+MASK_PROPORTION = 0.25  # Now represents a percentage (75%) of valid patches to mask
 
 
 # ENCODER and DECODER
 LAYER_NORM_EPS = 1e-6
-ENC_PROJECTION_DIM = 24  # Increased from 12 for better representation power
-DEC_PROJECTION_DIM = 12  # Increased from 6 for better reconstruction
+ENC_PROJECTION_DIM = 16  # Increased from 12 for better representation power
+DEC_PROJECTION_DIM = 16  # Increased from 6 for better reconstruction
 ENC_NUM_HEADS = 8       # Increased from 4 for better multi-head attention
-ENC_LAYERS = 12         # Increased from 6 for deeper encoder
+ENC_LAYERS = 8         # Increased from 6 for deeper encoder
 DEC_NUM_HEADS = 8       # Increased from 4 for better multi-head attention
-DEC_LAYERS = 6          # Increased from 2 for better reconstruction
+DEC_LAYERS = 8          # Increased from 2 for better reconstruction
 ENC_TRANSFORMER_UNITS = [
     ENC_PROJECTION_DIM * 2,
     ENC_PROJECTION_DIM,
@@ -132,6 +132,7 @@ class Patches(layers.Layer):
 
 
 ##############################
+
 
 
 class PatchEncoder(layers.Layer):
@@ -254,88 +255,93 @@ class PatchEncoder(layers.Layer):
             )
 
     def get_smart_indices(self, patches, batch_size):
-        """Smart masking strategy that masks 75% of patches with content (depth > 0)
-        while ensuring at least 25% of the animal body remains unmasked.
-        Images without enough valid patches will be marked for skipping."""
+        """Smart masking strategy with fixed number of patches (40).
+        Skip images where these patches don't cover at least 60% of the animal body."""
         
-        # Calculate average value for each patch
+        # Calculate average value for each patch to determine valid patches (animal body)
         patch_means = tf.reduce_mean(tf.abs(patches), axis=2)  # [batch_size, num_patches]
         
-        # Create a mask for valid (non-zero) patches
+        # Create a mask for valid (non-zero) patches - these are parts of the animal
         valid_mask = tf.cast(patch_means > 0, tf.float32)  # [batch_size, num_patches]
         
         # Count valid patches per image
         valid_counts = tf.reduce_sum(valid_mask, axis=1)  # [batch_size]
         
-        # Calculate minimum patches to preserve (25% - inverse of mask_proportion)
-        preservation_ratio = tf.constant(1.0 - self.mask_proportion, dtype=tf.float32)
-        min_unmasked = tf.cast(tf.math.ceil(valid_counts * preservation_ratio), tf.int32)  # [batch_size]
+        # Fixed number of patches to mask
+        FIXED_MASK_COUNT = 40
         
-        # Calculate the dynamic mask count for each image (75% of valid patches)
-        mask_counts = tf.cast(tf.math.floor(valid_counts * self.mask_proportion), tf.int32)  # [batch_size]
+        # Check if we have enough valid patches to mask (at least 60% of the animal must remain visible)
+        # This means at most 40% of valid patches can be masked
+        max_maskable_percentage = 0.4  # At most 40% can be masked (60% must remain visible)
         
-        # Make sure we don't mask everything - ensure minimum preservation
-        mask_counts = tf.minimum(mask_counts, tf.cast(valid_counts, tf.int32) - min_unmasked)
+        # Calculate the maximum number of masks allowed for each image (40% of valid patches)
+        max_masks_allowed = tf.cast(tf.math.ceil(valid_counts * max_maskable_percentage), tf.int32)
         
-        # Create fully random scores for valid patches
-        # Large random values (0-1000) to ensure complete randomization
-        random_scores = tf.random.uniform(tf.shape(patch_means), minval=0, maxval=1000, dtype=tf.float32)
+        # Conditions for each image: 
+        # 1. Does it have enough valid patches?
+        # 2. Would masking FIXED_MASK_COUNT patches leave at least 60% of animal visible?
+        has_enough_valid = valid_counts >= 20  # Has at least 20 valid patches
+        masking_allowed = tf.greater_equal(max_masks_allowed, FIXED_MASK_COUNT)  # Fixed mask count doesn't exceed 40% limit
         
-        # Only assign random scores to valid patches, zero out invalid patches
-        randomized_scores = random_scores * valid_mask
+        # Image is valid if it has enough valid patches AND masking wouldn't exceed our threshold
+        valid_image = tf.logical_and(has_enough_valid, masking_allowed)
         
-        # Sort patches by random scores (descending)
+        # Instead of random scores for all patches, we want to prioritize valid patches (animal body)
+        # We'll give high scores to valid patches and low scores to invalid patches
+        # This ensures we mask animal body parts first
+        
+        # Create scores where valid patches get high random values, invalid patches get very low values
+        random_scores_valid = tf.random.uniform(tf.shape(patch_means), minval=1000, maxval=2000, dtype=tf.float32)
+        random_scores_invalid = tf.random.uniform(tf.shape(patch_means), minval=0, maxval=10, dtype=tf.float32)
+        
+        # Combine scores - use valid mask to select which score to use for each patch
+        randomized_scores = valid_mask * random_scores_valid + (1.0 - valid_mask) * random_scores_invalid
+        
+        # Sort patches by scores (descending) to get candidates for masking
+        # Valid patches with high scores will be at the top
         _, indices = tf.nn.top_k(randomized_scores, k=self.num_patches)
         
-        # Conditions for each image: does it have enough valid patches?
-        has_enough_valid = valid_counts > 0  # Has at least some valid patches
-        
-        # The maximum mask count is variable now
-        max_mask_count = tf.reduce_max(mask_counts)
-        
-        # Create mask indices for each image (with padding to max count)
-        mask_indices = tf.zeros((batch_size, max_mask_count), dtype=tf.int32)
+        # Create mask indices for each image (fixed count or zeros for skipped images)
+        mask_indices = tf.zeros((batch_size, FIXED_MASK_COUNT), dtype=tf.int32)
         
         # Create an attention mask to identify skipped images (1 = keep, 0 = skip)
         # This will be used in loss calculation to exclude skipped images
-        self.attention_mask = tf.cast(has_enough_valid, tf.float32)
+        self.attention_mask = tf.cast(valid_image, tf.float32)
         
         # We also need to track the actual mask count per image for the unmask indices
-        self.mask_counts_per_image = mask_counts
+        # For valid images, it's FIXED_MASK_COUNT; for invalid ones, it's 0
+        self.mask_counts_per_image = tf.where(
+            valid_image,
+            tf.ones((batch_size,), dtype=tf.int32) * FIXED_MASK_COUNT,
+            tf.zeros((batch_size,), dtype=tf.int32)
+        )
         
-        # Count total skipped images and only log if there are any
-        total_skipped = batch_size - tf.reduce_sum(tf.cast(has_enough_valid, tf.int32))
-        if total_skipped > 0:
-            tf.print("Skipped", total_skipped, "images due to insufficient valid patches")
+        # Count total skipped images for logging
+        total_skipped = batch_size - tf.reduce_sum(tf.cast(valid_image, tf.int32))
         
-        # Helper function to process one image - avoids tf.cond type mismatches
+        # Helper function to process one image
         def get_indices_for_image(i, mask_indices_tensor):
             # Get sorted indices for this image
             image_indices = indices[i]
             
-            # Choose appropriate indices based on condition
-            use_valid_patches = has_enough_valid[i]
-            
-            # Get dynamic mask count for this specific image
-            this_mask_count = mask_counts[i]
+            # Check if this image should be processed
+            is_valid = valid_image[i]
             
             # Create placeholder indices (for skipped images)
-            placeholder_indices = tf.zeros(max_mask_count, dtype=tf.int32)
+            placeholder_indices = tf.zeros(FIXED_MASK_COUNT, dtype=tf.int32)
             
-            # Explicitly handle the two conditions directly
-            selected_indices = placeholder_indices
-            if use_valid_patches:
-                # Select the top indices up to this image's mask count
-                selected_indices_raw = image_indices[:this_mask_count]
-                # Pad with zeros to reach max_mask_count
-                padding = tf.zeros(max_mask_count - this_mask_count, dtype=tf.int32)
-                selected_indices = tf.concat([selected_indices_raw, padding], axis=0)
+            # Get proper mask indices for valid images
+            selected_indices = tf.cond(
+                is_valid,
+                lambda: image_indices[:FIXED_MASK_COUNT],  # Take top FIXED_MASK_COUNT indices
+                lambda: placeholder_indices  # Use zeros for invalid images
+            )
             
             # Update the mask indices for this image
             indices_update = tf.tensor_scatter_nd_update(
                 mask_indices_tensor,
                 tf.expand_dims(tf.expand_dims(i, 0), 1),  # [[i]]
-                tf.expand_dims(selected_indices, 0)  # [1, max_mask_count]
+                tf.expand_dims(selected_indices, 0)  # [1, FIXED_MASK_COUNT]
             )
             
             return i + 1, indices_update
@@ -347,29 +353,24 @@ class PatchEncoder(layers.Layer):
             loop_vars=(tf.constant(0), mask_indices)
         )
         
-        # Create unmask indices using the same approach, but with variable sized outputs
-        # First, determine the maximum number of unmasked patches
-        max_unmask_count = tf.reduce_max(self.num_patches - mask_counts)
-        unmask_indices = tf.zeros((batch_size, max_unmask_count), dtype=tf.int32)
+        # Create unmask indices using the same approach
+        # For uniformity, we'll use a fixed number of unmasked patches as well (NUM_PATCHES - FIXED_MASK_COUNT)
+        FIXED_UNMASK_COUNT = self.num_patches - FIXED_MASK_COUNT
+        unmask_indices = tf.zeros((batch_size, FIXED_UNMASK_COUNT), dtype=tf.int32)
         
         # Process each image to get unmask indices
         def get_unmask_for_image(i, unmask_indices_tensor):
-            # Only process images with enough valid patches
-            use_valid_patches = has_enough_valid[i]
+            # Only process valid images
+            is_valid = valid_image[i]
             
             # Get mask indices for this image
-            image_mask_indices = mask_indices[i][:mask_counts[i]]  # Only use the actual mask count
-            
-            # This image's unmask count
-            this_unmask_count = self.num_patches - mask_counts[i]
+            image_mask_indices = mask_indices[i]
             
             # Create a placeholder for invalid images
-            placeholder_indices = tf.range(max_unmask_count, dtype=tf.int32)
+            placeholder_indices = tf.range(FIXED_UNMASK_COUNT, dtype=tf.int32)
             
             # For valid images, calculate unmask indices properly
-            image_unmask_indices = placeholder_indices  # Default placeholder
-            
-            if use_valid_patches:
+            def get_valid_unmask():
                 # Get indices of non-masked patches
                 mask_indicator = tf.reduce_sum(
                     tf.one_hot(image_mask_indices, self.num_patches, on_value=1, off_value=0, dtype=tf.int32),
@@ -379,15 +380,25 @@ class PatchEncoder(layers.Layer):
                     tf.range(self.num_patches, dtype=tf.int32),
                     mask_indicator == 0
                 )
-                # Pad with zeros to reach max_unmask_count
-                padding = tf.zeros(max_unmask_count - this_unmask_count, dtype=tf.int32)
-                image_unmask_indices = tf.concat([unmask_raw, padding], axis=0)
+                # Pad if necessary to reach FIXED_UNMASK_COUNT
+                padding_needed = FIXED_UNMASK_COUNT - tf.shape(unmask_raw)[0]
+                padding = tf.zeros(tf.maximum(0, padding_needed), dtype=tf.int32)
+                padded_unmask = tf.concat([unmask_raw, padding], axis=0)
+                # Make sure we don't exceed FIXED_UNMASK_COUNT
+                return padded_unmask[:FIXED_UNMASK_COUNT]
+            
+            # Choose appropriate indices based on image validity
+            image_unmask_indices = tf.cond(
+                is_valid,
+                get_valid_unmask,
+                lambda: placeholder_indices
+            )
             
             # Update the unmask indices tensor
             indices_update = tf.tensor_scatter_nd_update(
                 unmask_indices_tensor,
                 tf.expand_dims(tf.expand_dims(i, 0), 1),  # [[i]]
-                tf.expand_dims(image_unmask_indices, 0)  # [1, max_unmask_count]
+                tf.expand_dims(image_unmask_indices, 0)  # [1, FIXED_UNMASK_COUNT]
             )
             
             return i + 1, indices_update
@@ -399,13 +410,23 @@ class PatchEncoder(layers.Layer):
             loop_vars=(tf.constant(0), unmask_indices)
         )
         
-        # Log proportion stats
-        valid_avg = tf.reduce_mean(tf.cast(valid_counts, tf.float32))
-        masked_avg = tf.reduce_mean(tf.cast(mask_counts, tf.float32))
+        # Log statistics
+        if total_skipped > 0:
+            tf.print("Skipped", total_skipped, "images (", 
+                     tf.cast(total_skipped, tf.float32) / tf.cast(batch_size, tf.float32) * 100.0,
+                     "%) due to insufficient valid patches for required visibility")
+        
+        # Log proportion stats for valid images (only count non-skipped for averages)
+        valid_count_sum = tf.reduce_sum(valid_counts * self.attention_mask)
+        valid_image_count = tf.maximum(tf.reduce_sum(self.attention_mask), 1.0)  # Avoid div by zero
+        
+        valid_avg = valid_count_sum / valid_image_count
+        masked_avg = tf.cast(FIXED_MASK_COUNT, tf.float32)
+        
         if valid_avg > 0:
             mask_ratio = masked_avg / valid_avg
-            tf.print("Average valid patches:", valid_avg, "Average masked:", masked_avg, 
-                     "Mask ratio:", mask_ratio, "Target:", self.mask_proportion)
+            tf.print("Average valid patches:", valid_avg, "Fixed mask count:", masked_avg, 
+                     "Mask ratio:", mask_ratio, "Target:", max_maskable_percentage)
         
         return mask_indices, unmask_indices
 
@@ -563,14 +584,160 @@ def create_encoder(num_heads=ENC_NUM_HEADS, num_layers=ENC_LAYERS):
     outputs = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
     return keras.Model(inputs, outputs, name="mae_encoder")
 
+
+########################################
+
+
+def create_improved_decoder(
+    num_layers=DEC_LAYERS, 
+    num_heads=DEC_NUM_HEADS, 
+    image_size=IMAGE_SIZE,
+    channels=CHANNELS,
+    patch_size=PATCH_SIZE
+):
+    """Create a decoder that preserves spatial information for better reconstruction.
+    Unlike the GlobalAveragePooling approach, this maintains per-patch representations.
+    """
+    inputs = layers.Input((None, ENC_PROJECTION_DIM))  # None for variable length
+    x = layers.Dense(DEC_PROJECTION_DIM)(inputs)
+
+    # Apply transformer blocks
+    for _ in range(num_layers):
+        # Layer normalization 1
+        x1 = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
+
+        # Multi-head attention - allows patches to interact
+        attention_output = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=DEC_PROJECTION_DIM, dropout=0.1
+        )(x1, x1)
+
+        # Skip connection 1
+        x2 = layers.Add()([attention_output, x])
+
+        # Layer normalization 2
+        x3 = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x2)
+
+        # MLP
+        x3 = mlp(x3, hidden_units=DEC_TRANSFORMER_UNITS, dropout_rate=0.1)
+
+        # Skip connection 2
+        x = layers.Add()([x3, x2])
+
+    # Final layer normalization
+    x = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
+    
+    # Project each patch embedding to the patch pixel space
+    # Each patch gets reconstructed to patch_size * patch_size * channels values
+    patch_outputs = layers.Dense(patch_size * patch_size * channels, activation="sigmoid")(x)
+    
+    # Create a hybrid decoder that works with both approaches:
+    # 1. A main branch that treats the output as a sequence of patches (spatial preservation)
+    # 2. A backup branch that uses global pooling (for stability when patches don't fit)
+    
+    # Branch 1: Main spatial information preservation path
+    # Just reshape each patch back to proper dimensions
+    patches_3d = layers.Reshape((-1, patch_size, patch_size, channels))(patch_outputs)
+
+    # Branch 2: Global pooling fallback (more stable but loses some spatial information)
+    global_features = layers.GlobalAveragePooling1D()(x)
+    global_output = layers.Dense(image_size * image_size * channels, activation="sigmoid")(global_features)
+    global_output = layers.Reshape((image_size, image_size, channels))(global_output)
+    
+    # Custom layer to combine both approaches
+    class HybridDecoder(layers.Layer):
+        def __init__(self, patch_size, image_size, channels, mode='spatial'):
+            """
+            Initialize the HybridDecoder
+            
+            Args:
+                patch_size: Size of each patch
+                image_size: Size of the full image
+                channels: Number of channels
+                mode: Decoder mode - 'global' (use global features only), 'spatial' (use spatial mapping),
+                      or 'hybrid' (try spatial first, fall back to global)
+            """
+            super().__init__(name="patches_to_image_layer")
+            self.patch_size = patch_size
+            self.image_size = image_size
+            self.channels = channels
+            self.patches_per_side = image_size // patch_size
+            self.num_patches = self.patches_per_side ** 2
+            self.mode = mode
+            
+        def call(self, inputs):
+            patches_3d, global_output = inputs
+            batch_size = tf.shape(patches_3d)[0]
+            actual_patch_count = tf.shape(patches_3d)[1]
+            
+            # Log info about the shapes for debugging
+            tf.print("HybridDecoder shapes - batch_size:", batch_size, 
+                    "patches_shape:", tf.shape(patches_3d), 
+                    "expected patches:", self.num_patches,
+                    "mode:", self.mode)
+            
+            # Now with fixed patch count, we can use direct spatial mapping
+            
+            if self.mode == 'global':
+                # Just return the global output (fully connected approach)
+                return global_output
+            
+            elif self.mode == 'spatial' or self.mode == 'hybrid':
+                # Check if we have the expected number of patches
+                patches_match = tf.equal(actual_patch_count, self.num_patches)
+                
+                def use_spatial_mapping():
+                    # Reshape patches to the correct grid shape
+                    # [batch_size, num_patches, patch_size, patch_size, channels] ->
+                    # [batch_size, patches_per_side, patches_per_side, patch_size, patch_size, channels]
+                    grid_shape = [batch_size, self.patches_per_side, self.patches_per_side, 
+                                 self.patch_size, self.patch_size, self.channels]
+                    
+                    # Make sure all dimensions are known to avoid reshape errors
+                    patches_reshaped = tf.reshape(patches_3d, grid_shape)
+                    
+                    # Transpose to get correct ordering for reconstruction
+                    # [batch, row, col, patch_h, patch_w, channels] -> [batch, row*patch_h, col*patch_w, channels]
+                    reordered = tf.transpose(patches_reshaped, [0, 1, 3, 2, 4, 5])
+                    
+                    # Reshape to final image dimensions
+                    # [batch, row, patch_h, col, patch_w, channels] -> [batch, row*patch_h, col*patch_w, channels]
+                    spatial_output = tf.reshape(reordered, 
+                                             [batch_size, self.image_size, self.image_size, self.channels])
+                    
+                    return spatial_output
+                
+                def use_global_output():
+                    # Use the global output as fallback
+                    return global_output
+                
+                if self.mode == 'hybrid':
+                    # In hybrid mode, attempt spatial mapping if patch count matches
+                    # Otherwise fall back to global output
+                    return tf.cond(patches_match, use_spatial_mapping, use_global_output)
+                else: 
+                    # In spatial mode, always attempt spatial mapping
+                    # This might throw an error if patch count doesn't match
+                    return use_spatial_mapping()
+    
+    # Combine both approaches using the hybrid decoder with hybrid mode
+    # This will attempt spatial mapping when patch count matches, falling back to global
+    # when needed
+    outputs = HybridDecoder(patch_size, image_size, channels, mode='hybrid')([patches_3d, global_output])
+    
+    return keras.Model(inputs, outputs, name="mae_improved_decoder")
+
+
+
 ######################
 
-
+'''
 def create_decoder(
     num_layers=DEC_LAYERS, num_heads=DEC_NUM_HEADS, image_size=IMAGE_SIZE,
     channels = CHANNELS
 ):
-    inputs = layers.Input((None, ENC_PROJECTION_DIM))  # Change to None for variable length
+    """Create a decoder that can handle variable input shapes.
+    Now using GlobalAveragePooling1D to handle variable-length inputs."""
+    inputs = layers.Input((None, ENC_PROJECTION_DIM))  # None for variable length
     x = layers.Dense(DEC_PROJECTION_DIM)(inputs)
 
     for _ in range(num_layers):
@@ -603,9 +770,31 @@ def create_decoder(
     outputs = layers.Reshape((image_size, image_size, channels))(pre_final)
 
     return keras.Model(inputs, outputs, name="mae_decoder")
-
+'''
 ############################
+# 4. Use a custom loss function that focuses on both structure and detail
 
+def combined_reconstruction_loss(y_true, y_pred):
+    # MSE for pixel-level reconstruction
+    mse_loss = tf.keras.losses.MeanSquaredError()(y_true, y_pred)
+    
+    # Add a structural similarity term (higher weight to edges and boundaries)
+    # Extract edges using gradient approximation
+    def extract_edges(x):
+        # Simple gradient approximation
+        h_grad = x[:, 1:, :, :] - x[:, :-1, :, :]
+        v_grad = x[:, :, 1:, :] - x[:, :, :-1, :]
+        return tf.concat([h_grad, v_grad], axis=0)
+    
+    edges_true = extract_edges(y_true)
+    edges_pred = extract_edges(y_pred)
+    
+    # Edge reconstruction loss
+    edge_loss = tf.keras.losses.MeanSquaredError()(edges_true, edges_pred)
+    
+    # Combine losses (give more weight to edge loss)
+    combined_loss = 0.7 * mse_loss + 0.3 * edge_loss
+    return combined_loss
 
 class MaskedAutoencoder(keras.Model):
     def __init__(
