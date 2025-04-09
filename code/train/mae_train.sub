@@ -1,6 +1,6 @@
 # mae_train.sub
 # Specify the Apptainer image
-container_image = file:///staging/negreiro/mae.sif
+container_image = file:///staging/negreiro/mae_pytorch.sif
 
 executable = mae_train.sh
 arguments = $(batch)
@@ -11,7 +11,7 @@ log = /home/negreiro/MAE/logs/mae_train$(Cluster)_$(batch).log
 
 should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
-transfer_input_files = mae_train.py, mae_train.sh, /home/negreiro/MAE/code/utils/mae_code.py
+transfer_input_files = mae_train.py, mae_train.sh, /home/negreiro/MAE/code/utils/mae_models.py, /home/negreiro/MAE/code/utils/pos_embed.py
 
 # GPU requirements
 require_gpus = (Capability <= 7.5)
